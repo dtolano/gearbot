@@ -1,139 +1,146 @@
 import os
-import re
-import aiohttp
-import aiosqlite
+import asyncio
+import datetime as dt
 import discord
-from discord.ext import tasks, commands
+from discord.ext import commands, tasks
+import aiohttp
 
-# ===== ENVIRONMENT VARIABLES =====
 TOKEN = os.getenv("DISCORD_TOKEN")
-CHANNEL_ID = int(os.getenv("POST_CHANNEL_ID"))
+POST_CHANNEL_ID = os.getenv("POST_CHANNEL_ID")
 
-# ===== COMPANY SOURCES =====
-GREENHOUSE_BOARDS = [
-    "raytheon",
-    "honeywell",
-    "lockheedmartin",
-]
+if not TOKEN:
+    raise RuntimeError("Missing DISCORD_TOKEN env var (set it in Fly secrets).")
+if not POST_CHANNEL_ID:
+    raise RuntimeError("Missing POST_CHANNEL_ID env var (set it in Fly secrets).")
 
-LEVER_ACCOUNTS = [
-    "spacex",
-    "tesla",
-]
+POST_CHANNEL_ID = int(POST_CHANNEL_ID)
 
-# ===== FILTER KEYWORDS =====
-KEYWORDS = [
-    "intern", "internship", "co-op", "coop",
-    "mechanical", "engineering", "aerospace",
-    "robotics", "mechatronics", "manufacturing"
-]
-
-DB = "posted.db"
-
-def matches(text):
-    text = text.lower()
-    return any(k in text for k in KEYWORDS)
-
-def make_key(job):
-    return re.sub(r"\s+", "", f"{job['source']}{job['id']}").lower()
-
+# Intents: message_content is required for prefix commands like !ping
 intents = discord.Intents.default()
+intents.message_content = True
+
 bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ===== DATABASE =====
-async def init_db():
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY)"
-        )
-        await db.commit()
 
-async def seen(job_id):
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute(
-            "SELECT 1 FROM jobs WHERE id=?", (job_id,)
-        )
-        return await cur.fetchone() is not None
+def build_embed(title: str, url: str, source: str) -> discord.Embed:
+    e = discord.Embed(
+        title=title[:256],
+        url=url,
+        description=f"Source: **{source}**",
+        timestamp=dt.datetime.now(dt.timezone.utc),
+    )
+    e.set_footer(text="Gear Labs Bot")
+    return e
 
-async def mark(job_id):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute(
-            "INSERT OR IGNORE INTO jobs VALUES(?)", (job_id,)
-        )
-        await db.commit()
 
-# ===== FETCHERS =====
-async def fetch_greenhouse(session, company):
-    url = f"https://boards-api.greenhouse.io/v1/boards/{company}/jobs"
-    async with session.get(url) as r:
-        data = await r.json()
+async def fetch_json(session: aiohttp.ClientSession, url: str):
+    async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
+        r.raise_for_status()
+        return await r.json()
 
-    return [{
-        "source": f"Greenhouse:{company}",
-        "id": j["id"],
-        "title": j["title"],
-        "location": j["location"]["name"],
-        "url": j["absolute_url"]
-    } for j in data.get("jobs", [])]
 
-async def fetch_lever(session, company):
-    url = f"https://api.lever.co/v0/postings/{company}?mode=json"
-    async with session.get(url) as r:
-        data = await r.json()
+async def scan_jobs_once(limit: int = 5):
+    """
+    Simple scan using GitHub Jobs-like sources:
+    We'll use two reliable public sources that allow simple linking:
+      - Simplify Jobs GitHub repo (internship list)
+      - Pitt CSC Summer 2026 Internships repo (if available)
+    We’ll just post repo search links + a few items from a JSON endpoint when possible.
+    """
 
-    return [{
-        "source": f"Lever:{company}",
-        "id": j["id"],
-        "title": j["text"],
-        "location": j["categories"].get("location", "Unknown"),
-        "url": j["hostedUrl"]
-    } for j in data]
+    results = []
 
-# ===== MAIN SCAN LOOP =====
-@tasks.loop(hours=6)
-async def scan_jobs():
-    channel = bot.get_channel(CHANNEL_ID)
-    if not channel:
-        return
+    # 1) Simplify Jobs repo (link is stable)
+    results.append((
+        "Internships List (Simplify Jobs)",
+        "https://github.com/SimplifyJobs/Summer2026-Internships",
+        "GitHub"
+    ))
 
-    async with aiohttp.ClientSession() as session:
-        jobs = []
+    # 2) Pitt CSC repo (common internships repo)
+    results.append((
+        "Internships List (Pitt CSC)",
+        "https://github.com/pittcsc/Summer2026-Internships",
+        "GitHub"
+    ))
 
-        for c in GREENHOUSE_BOARDS:
-            try:
-                jobs += await fetch_greenhouse(session, c)
-            except Exception as e:
-                print("Greenhouse error:", c, e)
+    # 3) Optional: Remotive API (has JSON, but more general roles)
+    # We'll search for "intern" and add a couple entries if returned
+    try:
+        async with aiohttp.ClientSession(headers={"User-Agent": "GearLabsBot/1.0"}) as session:
+            data = await fetch_json(session, "https://remotive.com/api/remote-jobs?search=intern")
+            jobs = data.get("jobs", [])[: max(0, limit - len(results))]
+            for j in jobs:
+                title = j.get("title", "Intern Role")
+                url = j.get("url", "")
+                company = j.get("company_name", "Remotive")
+                if url:
+                    results.append((f"{title} — {company}", url, "Remotive"))
+    except Exception:
+        # If API fails, we still have the GitHub lists, so ignore.
+        pass
 
-        for c in LEVER_ACCOUNTS:
-            try:
-                jobs += await fetch_lever(session, c)
-            except Exception as e:
-                print("Lever error:", c, e)
+    return results[:limit]
 
-    for job in jobs:
-        if not matches(job["title"]):
-            continue
 
-        key = make_key(job)
-        if await seen(key):
-            continue
-
-        embed = discord.Embed(
-            title=job["title"],
-            description=f"📍 {job['location']}\n🔗 {job['source']}",
-            url=job["url"],
-            color=0x1f8b4c
-        )
-
-        await channel.send(embed=embed)
-        await mark(key)
-
-# ===== EVENTS =====
 @bot.event
 async def on_ready():
-    await init_db()
-    scan_jobs.start()
-    print(f"Bot online as {bot.user}")
+    print(f"Logged in as {bot.user} (id={bot.user.id})")
+    if not auto_scan.is_running():
+        auto_scan.start()
+
+
+@bot.command()
+async def ping(ctx: commands.Context):
+    await ctx.send("pong ✅")
+
+
+@bot.command()
+async def scan(ctx: commands.Context):
+    """Manually scan and post to the configured channel."""
+    await ctx.send("Scanning internships… 🔎")
+    channel = bot.get_channel(POST_CHANNEL_ID)
+    if channel is None:
+        await ctx.send("I can't access the post channel. Check POST_CHANNEL_ID and bot permissions.")
+        return
+
+    jobs = await scan_jobs_once(limit=6)
+    if not jobs:
+        await ctx.send("No results found right now.")
+        return
+
+    posted = 0
+    for title, url, source in jobs:
+        try:
+            await channel.send(embed=build_embed(title, url, source))
+            posted += 1
+        except Exception as e:
+            await ctx.send(f"Failed posting one item: {e}")
+            break
+
+    await ctx.send(f"Posted {posted} items to <#{POST_CHANNEL_ID}> ✅")
+
+
+@tasks.loop(minutes=30)
+async def auto_scan():
+    """Auto scan every 30 minutes and post to the target channel."""
+    channel = bot.get_channel(POST_CHANNEL_ID)
+    if channel is None:
+        print("auto_scan: channel not found (check POST_CHANNEL_ID / permissions).")
+        return
+
+    jobs = await scan_jobs_once(limit=3)
+    for title, url, source in jobs:
+        try:
+            await channel.send(embed=build_embed(title, url, source))
+            await asyncio.sleep(1)
+        except Exception as e:
+            print("auto_scan post error:", e)
+
+
+@auto_scan.before_loop
+async def before_auto_scan():
+    await bot.wait_until_ready()
+
 
 bot.run(TOKEN)
